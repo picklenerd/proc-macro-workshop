@@ -23,36 +23,21 @@ pub fn derive(input: TokenStream) -> TokenStream {
         _ => Vec::new(),
     };
 
-    let setters: Vec<proc_macro2::TokenStream> = fields
-        .iter()
-        .map(FieldInfo::setter)
-        .collect();
-
-    let validations: Vec<proc_macro2::TokenStream> = fields
-        .iter()
-        .map(FieldInfo::validation)
-        .collect();
-
-    let field_builders: Vec<proc_macro2::TokenStream> = fields
-        .iter()
-        .map(FieldInfo::build)
-        .collect();
+    let field_definitions = data_from_fields(&fields, FieldInfo::field_definition);
+    let default_builders = data_from_fields(&fields, FieldInfo::default_builder);
+    let setters = data_from_fields(&fields, FieldInfo::setter);
+    let validations = data_from_fields(&fields, FieldInfo::validation);
+    let field_builders = data_from_fields(&fields, FieldInfo::build);
 
     let result = quote! {
         pub struct #builder_name {
-            executable: Option<String>,
-            args: Option<Vec<String>>,
-            env: Option<Vec<String>>,
-            current_dir: Option<String>,
+            #(#field_definitions)*
         }
 
         impl #struct_name {
             pub fn builder() -> #builder_name {
                 #builder_name {
-                    executable: None,
-                    args: None,
-                    env: None,
-                    current_dir: None,
+                    #(#default_builders)*
                 }
             }
         }
@@ -79,6 +64,15 @@ pub fn derive(input: TokenStream) -> TokenStream {
     result.into()
 }
 
+fn data_from_fields<F>(fields: &[FieldInfo], data_extractor: F) -> Vec<proc_macro2::TokenStream> 
+where F: Fn(&FieldInfo) -> proc_macro2::TokenStream
+{
+    fields
+        .iter()
+        .map(data_extractor)
+        .collect()
+}
+
 struct FieldInfo {
     pub ident: Ident,
     pub inner_type: Type,
@@ -103,6 +97,23 @@ impl FieldInfo {
                 })
             },
         }
+    }
+
+    pub fn field_definition(&self) -> proc_macro2::TokenStream {
+        let parameter_name = &self.ident;
+        let parameter_type = &self.inner_type;
+
+        quote! {
+            #parameter_name: Option<#parameter_type>,
+        }    
+    }
+
+    pub fn default_builder(&self) -> proc_macro2::TokenStream {
+        let parameter_name = &self.ident;
+
+        quote! {
+            #parameter_name: None,
+        } 
     }
 
     pub fn setter(&self) -> proc_macro2::TokenStream {
