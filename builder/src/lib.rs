@@ -51,6 +51,21 @@ pub fn derive(input: TokenStream) -> TokenStream {
                 self.current_dir = Some(current_dir);
                 self
             }
+
+            pub fn build(&mut self) -> Result<#struct_name, Box<dyn std::error::Error>> {
+                match (self.executable.clone(), self.args.clone(), self.env.clone(), self.current_dir.clone()) {
+                    (None, _, _, _) => Err("Missing field: executable".into()),
+                    (_, None, _, _) => Err("Missing field: args".into()),
+                    (_, _, None, _) => Err("Missing field: env".into()),
+                    (_, _, _, None) => Err("Missing field: current_dir".into()),
+                    (Some(executable), Some(args), Some(env), Some(current_dir)) => Ok(#struct_name {
+                        executable,
+                        args,
+                        env,
+                        current_dir,
+                    }),
+                }
+            }
         }
     };
 
