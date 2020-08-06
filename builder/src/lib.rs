@@ -4,10 +4,10 @@ use proc_macro::TokenStream;
 use syn::{Data, Ident, Field, Type, DeriveInput, parse_macro_input};
 use quote::{quote, format_ident};
 
-#[proc_macro_derive(Builder)]
+#[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive(input: TokenStream) -> TokenStream {
-
     let input = parse_macro_input!(input as DeriveInput);
+    // eprintln!("Input: {:#?}", &input);
 
     let struct_name = format_ident!("{}", input.ident);
     let builder_name = format_ident!("{}Builder", input.ident);
@@ -61,6 +61,8 @@ pub fn derive(input: TokenStream) -> TokenStream {
         }
     };
 
+    // eprintln!("Output: {:#?}", &result);
+
     result.into()
 }
 
@@ -73,20 +75,27 @@ where F: Fn(&FieldInfo) -> proc_macro2::TokenStream
         .collect()
 }
 
+struct StructInfo {
+    ident: Ident,
+    fields: Vec<FieldInfo>,
+}
+
 struct FieldInfo {
     pub ident: Ident,
     pub inner_type: Type,
     pub is_required: bool,
+    pub attributes: Vec<AttributeInfo>
 }
 
 impl FieldInfo {
     pub fn from_field(field: &Field) -> Option<Self> {
-        match get_option_type(field) {
+        match option_info(field) {
             Some((ident, inner_type)) => {
                 Some(Self {
                     ident,
                     inner_type,
                     is_required: false,
+                    attributes: Vec::new(),
                 })
             }
             None => {
@@ -94,6 +103,7 @@ impl FieldInfo {
                     ident: field.ident.clone()?,
                     inner_type: field.ty.clone(),
                     is_required: true,
+                    attributes: Vec::new(),
                 })
             },
         }
@@ -157,7 +167,13 @@ impl FieldInfo {
     }
 }
 
-fn get_option_type(field: &Field) -> Option<(Ident, Type)> {
+struct AttributeInfo {
+    ident: Ident,
+    tag: Ident,
+    value: String,
+}
+
+fn option_info(field: &Field) -> Option<(Ident, Type)> {
     use syn::{Path, TypePath, PathArguments, GenericArgument};
 
     let ident = field.ident.as_ref()?;
