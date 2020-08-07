@@ -1,33 +1,29 @@
 extern crate proc_macro;
 
 use proc_macro::TokenStream;
-use syn::{Data, Ident, Field, Type, DeriveInput, parse_macro_input};
+use syn::{Data, Attribute, Ident, Field, Type, DeriveInput, parse_macro_input};
 use quote::{quote, format_ident};
 
 #[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-    // eprintln!("Input: {:#?}", &input);
 
     let struct_name = format_ident!("{}", input.ident);
     let builder_name = format_ident!("{}Builder", input.ident);
 
-    let fields = match input.data {
-        Data::Struct(struct_data) => {
-            struct_data.fields
-                .iter()
-                .map(FieldInfo::from_field)
-                .flatten()
-                .collect()
-        },
-        _ => Vec::new(),
-    };
+    let struct_info = StructInfo::from(&input);
 
-    let field_definitions = data_from_fields(&fields, FieldInfo::field_definition);
-    let default_builders = data_from_fields(&fields, FieldInfo::default_builder);
-    let setters = data_from_fields(&fields, FieldInfo::setter);
-    let validations = data_from_fields(&fields, FieldInfo::validation);
-    let field_builders = data_from_fields(&fields, FieldInfo::build);
+    let field_definitions = data_from_fields(&struct_info.fields, FieldInfo::field_definition);
+    let default_builders = data_from_fields(&struct_info.fields, FieldInfo::default_builder);
+    let setters = data_from_fields(&struct_info.fields, FieldInfo::setter);
+    let validations = data_from_fields(&struct_info.fields, FieldInfo::validation);
+    let each_builders = data_from_fields(&struct_info.fields, FieldInfo::each);
+    let field_builders = data_from_fields(&struct_info.fields, FieldInfo::build);
+
+    for builder in &each_builders {
+        println!("{}", builder);
+    }
+    println!("--");
 
     let result = quote! {
         pub struct #builder_name {
@@ -43,8 +39,6 @@ pub fn derive(input: TokenStream) -> TokenStream {
         }
 
         impl #builder_name {
-            #(#setters)*
-
             pub fn build(&mut self) -> Result<#struct_name, Box<dyn std::error::Error>> {
                 let mut missing_fields = Vec::new();
 
@@ -58,6 +52,10 @@ pub fn derive(input: TokenStream) -> TokenStream {
                     Err(format!("Missing fields: {}", missing_fields.join(",")).into())
                 }
             }
+
+            #(#setters)*
+
+            #(#each_builders)*
         }
     };
 
@@ -75,43 +73,70 @@ where F: Fn(&FieldInfo) -> proc_macro2::TokenStream
         .collect()
 }
 
+#[derive(Debug)]
 struct StructInfo {
-    ident: Ident,
-    fields: Vec<FieldInfo>,
+    pub ident: Ident,
+    pub fields: Vec<FieldInfo>,
 }
 
+impl From<&DeriveInput> for StructInfo {
+    fn from(input: &DeriveInput) -> Self {
+        let fields = match &input.data {
+            Data::Struct(struct_data) => {
+                struct_data.fields
+                    .iter()
+                    .map(FieldInfo::new)
+                    .flatten()
+                    .collect()
+            },
+            _ => Vec::new(),
+        };
+
+        Self {
+            ident: input.ident.clone(),
+            fields,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum SpecialField {
+    Vec(Type),
+    Option(Type),
+}
+
+#[derive(Debug)]
 struct FieldInfo {
     pub ident: Ident,
-    pub inner_type: Type,
-    pub is_required: bool,
+    pub ty: Type,
+    pub special_field: Option<SpecialField>,
     pub attributes: Vec<AttributeInfo>
 }
 
 impl FieldInfo {
-    pub fn from_field(field: &Field) -> Option<Self> {
-        match option_info(field) {
-            Some((ident, inner_type)) => {
+    pub fn new(field: &Field) -> Option<Self> {
+        let attributes = field.attrs
+            .iter()
+            .map(AttributeInfo::new)
+            .flatten()
+            .collect();
+
+        match &field.ident {
+            Some(ident) => {
                 Some(Self {
-                    ident,
-                    inner_type,
-                    is_required: false,
-                    attributes: Vec::new(),
-                })
-            }
-            None => {
-                Some(Self {
-                    ident: field.ident.clone()?,
-                    inner_type: field.ty.clone(),
-                    is_required: true,
-                    attributes: Vec::new(),
-                })
+                    ident: ident.clone(),
+                    ty: field.ty.clone(),
+                    special_field: special_field_info(&field),
+                    attributes,
+                })        
             },
+            None => None,
         }
     }
 
     pub fn field_definition(&self) -> proc_macro2::TokenStream {
         let parameter_name = &self.ident;
-        let parameter_type = &self.inner_type;
+        let parameter_type = &self.ty;
 
         quote! {
             #parameter_name: Option<#parameter_type>,
@@ -121,62 +146,138 @@ impl FieldInfo {
     pub fn default_builder(&self) -> proc_macro2::TokenStream {
         let parameter_name = &self.ident;
 
-        quote! {
-            #parameter_name: None,
-        } 
+        match self.special_field {
+            Some(SpecialField::Vec(_)) => quote! {
+                #parameter_name: Vec::new(),
+            },
+            _ => quote! {
+                #parameter_name: None,
+            } 
+        }
     }
 
     pub fn setter(&self) -> proc_macro2::TokenStream {
         let parameter_name = &self.ident;
-        let parameter_type = &self.inner_type;
+        let parameter_type = &self.ty;
 
-        quote! {
-            pub fn #parameter_name(&mut self, #parameter_name: #parameter_type) -> &mut Self {
-                self.#parameter_name = Some(#parameter_name);
-                self
-            }
+        match &self.special_field  {
+            Some(SpecialField::Vec(_)) => proc_macro2::TokenStream::new(),
+            _ => {
+                quote! {
+                    pub fn #parameter_name(&mut self, #parameter_name: #parameter_type) -> &mut Self {
+                        self.#parameter_name = Some(#parameter_name);
+                        self
+                    }
+                }
+            },
         }
     }
 
     pub fn validation(&self) -> proc_macro2::TokenStream {
-        if !self.is_required {
-            return proc_macro2::TokenStream::new();
+        match &self.special_field {
+            Some(SpecialField::Option(_)) => {
+                let parameter_name = &self.ident;
+
+                quote! {
+                    if self.#parameter_name.is_none() {
+                        missing_fields.push(stringify!(#parameter_name));
+                    }
+                }
+            },
+            _ => proc_macro2::TokenStream::new(),
         }
+    }
 
-        let parameter_name = &self.ident;
+    pub fn each(&self) -> proc_macro2::TokenStream {
+        match &self.special_field {
+            Some(SpecialField::Vec(inner_type)) => {
+                let parameter_name = &self.ident;
+        
+                let each_attr = &self.attributes
+                    .iter()
+                    .find(|attr| attr.tag == "each");
 
-        quote! {
-            if self.#parameter_name.is_none() {
-                missing_fields.push(stringify!(#parameter_name));
-            }
+                match each_attr {
+                    Some(each_attr) => {
+                        let function_name = format_ident!("{}", &each_attr.value);
+
+                        quote! {
+                            pub fn #function_name(&mut self, #function_name: #inner_type) -> &mut Self {
+                                self.#parameter_name.push(#function_name);
+                                self
+                            }
+                        }
+                    },
+                    None => proc_macro2::TokenStream::new(),
+                }
+            },
+            _ => proc_macro2::TokenStream::new(),
         }
     }
 
     pub fn build(&self) -> proc_macro2::TokenStream {
         let parameter_name = &self.ident;
 
-        if self.is_required {
+        if let Some(SpecialField::Option(_)) = self.special_field {
             quote! {
-                #parameter_name: self.#parameter_name.clone().unwrap(),
+                #parameter_name: self.#parameter_name.clone(),
             }
         } else {
             quote! {
-                #parameter_name: self.#parameter_name.clone(),
+                #parameter_name: self.#parameter_name.clone().unwrap(),
             }
         }
     }
 }
 
+#[derive(Debug)]
 struct AttributeInfo {
-    ident: Ident,
-    tag: Ident,
-    value: String,
+    pub ident: Ident,
+    pub tag:  Ident,
+    pub value: String,
 }
 
-fn option_info(field: &Field) -> Option<(Ident, Type)> {
-    use syn::{Path, TypePath, PathArguments, GenericArgument};
+impl AttributeInfo {
+    pub fn new(attribute: &Attribute) -> Option<Self> {
+        use proc_macro2::TokenTree;
+        use syn::PathSegment;
 
-    let ident = field.ident.as_ref()?;
+        let ident = match &attribute.path.segments.iter().next() {
+            Some(PathSegment { ident, .. }) => ident.clone(),
+            _ => return None,
+        };
+
+        let (tag, value) = match attribute.tokens.clone().into_iter().next() {
+            Some(TokenTree::Group(group)) => {
+                let tokens: Vec<TokenTree> = group
+                    .stream()
+                    .into_iter()
+                    .collect();
+
+                match &tokens.as_slice() {
+                    &[TokenTree::Ident(ident), TokenTree::Punct(punct), TokenTree::Literal(literal)] => {
+                        if punct.as_char() == '=' {
+                            (ident.clone(), literal.to_string().replace("\"", ""))
+                        } else {
+                            return None
+                        }
+                    },
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+
+        Some(Self {
+            ident,
+            tag,
+            value,
+        })
+    }
+}
+
+fn special_field_info(field: &Field) -> Option<SpecialField> {
+    use syn::{Path, TypePath, PathArguments, GenericArgument};
 
     match &field.ty {
         Type::Path(
@@ -193,7 +294,18 @@ fn option_info(field: &Field) -> Option<(Ident, Type)> {
                 if let PathArguments::AngleBracketed(args) = &segment.arguments {
                     let arg = args.args.iter().next()?;
                     if let GenericArgument::Type(arg_type) = arg {
-                        Some((ident.clone(), arg_type.clone()))
+                        Some(SpecialField::Option(arg_type.clone()))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else if segment.ident == "Vec" {
+                if let PathArguments::AngleBracketed(args) = &segment.arguments {
+                    let arg = args.args.iter().next()?;
+                    if let GenericArgument::Type(arg_type) = arg {
+                        Some(SpecialField::Vec(arg_type.clone()))
                     } else {
                         None
                     }
